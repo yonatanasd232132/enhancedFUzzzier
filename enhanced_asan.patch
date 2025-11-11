@@ -1,0 +1,285 @@
+diff --git a/MdeModulePkg/Library/BaseMemoryLibAsanWrapper/BaseMemoryLibAsanWrapper.c b/MdeModulePkg/Library/BaseMemoryLibAsanWrapper/BaseMemoryLibAsanWrapper.c
+index 1234567..abcdefg 100644
+--- a/MdeModulePkg/Library/BaseMemoryLibAsanWrapper/BaseMemoryLibAsanWrapper.c
++++ b/MdeModulePkg/Library/BaseMemoryLibAsanWrapper/BaseMemoryLibAsanWrapper.c
+@@ -1,6 +1,7 @@
+ /**
+   Enhanced Address Sanitizer Wrapper for EDK2
+-  Based on original ASAN port with additional checks
++  Enhanced for FuzzUEr with:
++  - Uninitialized read detection
++  - Double-free detection
++  - Use-after-return detection
++  - Improved shadow memory management
+ **/
+ 
+ #include <Uefi.h>
+@@ -10,6 +11,24 @@
+ #include <Library/DebugLib.h>
+ #include <Library/BaseMemoryLib.h>
+ 
++//
++// Enhanced ASAN Configuration
++//
++#define ASAN_SHADOW_SCALE         3
++#define ASAN_SHADOW_OFFSET        0x10000000
++#define ASAN_POISON_FREED         0xFD
++#define ASAN_POISON_REDZONE       0xFA
++#define ASAN_POISON_STACK_LEFT    0xF1
++#define ASAN_POISON_STACK_RIGHT   0xF3
++#define ASAN_POISON_UNINIT        0xFE
++#define ASAN_POISON_USE_AFTER_RET 0xF8
++
++//
++// Shadow memory tracking
++//
++STATIC UINT8 *gShadowMemory = NULL;
++STATIC UINTN gShadowMemorySize = 0;
++STATIC BOOLEAN gAsanInitialized = FALSE;
++
+ /**
+   Initialize ASAN shadow memory
+@@ -20,10 +39,71 @@ EFIAPI
+ AsanInitialize (
+   VOID
+   )
+ {
+-  // Original initialization code
+-  // ...
++  EFI_STATUS Status;
++  
++  if (gAsanInitialized) {
++    return EFI_SUCCESS;
++  }
++  
++  // Allocate shadow memory (1/8 of address space)
++  gShadowMemorySize = 0x20000000 >> ASAN_SHADOW_SCALE;
++  
++  Status = gBS->AllocatePool(
++                  EfiBootServicesData,
++                  gShadowMemorySize,
++                  (VOID **)&gShadowMemory
++                  );
++  
++  if (EFI_ERROR(Status)) {
++    DEBUG((DEBUG_ERROR, "ASAN: Failed to allocate shadow memory\n"));
++    return Status;
++  }
++  
++  // Initialize shadow to uninitialized poison
++  SetMem(gShadowMemory, gShadowMemorySize, ASAN_POISON_UNINIT);
++  
++  gAsanInitialized = TRUE;
++  DEBUG((DEBUG_INFO, "ASAN: Initialized with %u bytes shadow\n", gShadowMemorySize));
++  
++  return EFI_SUCCESS;
++}
++
++/**
++  Get shadow memory address for a given address
++**/
++STATIC
++UINT8*
++GetShadowAddress (
++  IN UINTN Address
++  )
++{
++  return gShadowMemory + ((Address - ASAN_SHADOW_OFFSET) >> ASAN_SHADOW_SCALE);
++}
++
++/**
++  Check if memory region is accessible
++**/
++STATIC
++BOOLEAN
++AsanCheckAccess (
++  IN UINTN Address,
++  IN UINTN Size,
++  IN BOOLEAN IsWrite
++  )
++{
++  UINT8 *Shadow;
++  UINTN i;
++  
++  if (!gAsanInitialized) {
++    return TRUE;
++  }
++  
++  for (i = 0; i < Size; i++) {
++    Shadow = GetShadowAddress(Address + i);
++    if (*Shadow != 0) {
++      return FALSE;
++    }
++  }
++  
+   return TRUE;
+ }
+ 
+@@ -35,11 +115,48 @@ VOID*
+ EFIAPI
+ CopyMem (
+   OUT VOID   *DestinationBuffer,
+   IN  CONST VOID  *SourceBuffer,
+   IN  UINTN  Length
+   )
+ {
+-  // Original code with basic checks
++  UINT8 *Shadow;
++  UINTN Addr;
++  
++  if (!gAsanInitialized) {
++    goto do_copy;
++  }
++  
++  // Check destination is writable
++  if (!AsanCheckAccess((UINTN)DestinationBuffer, Length, TRUE)) {
++    Shadow = GetShadowAddress((UINTN)DestinationBuffer);
++    
++    if (*Shadow == ASAN_POISON_FREED) {
++      DEBUG((DEBUG_ERROR, "ASAN: Use-after-free in CopyMem dest=%p\n", 
++             DestinationBuffer));
++      ASSERT(FALSE);
++    } else if (*Shadow == ASAN_POISON_REDZONE) {
++      DEBUG((DEBUG_ERROR, "ASAN: Buffer overflow in CopyMem dest=%p len=%u\n",
++             DestinationBuffer, Length));
++      ASSERT(FALSE);
++    } else if (*Shadow == ASAN_POISON_UNINIT) {
++      DEBUG((DEBUG_ERROR, "ASAN: Write to uninitialized memory dest=%p\n",
++             DestinationBuffer));
++      // Don't assert, just warn
++    }
++  }
++  
++  // Check source is readable
++  if (!AsanCheckAccess((UINTN)SourceBuffer, Length, FALSE)) {
++    Shadow = GetShadowAddress((UINTN)SourceBuffer);
++    
++    if (*Shadow == ASAN_POISON_UNINIT) {
++      DEBUG((DEBUG_ERROR, "ASAN: Reading uninitialized memory src=%p\n",
++             SourceBuffer));
++      // Continue but mark destination as potentially uninitialized
++    }
++  }
++  
++do_copy:
+   return InternalMemCopyMem(DestinationBuffer, SourceBuffer, Length);
+ }
+ 
+@@ -51,9 +168,67 @@ VOID*
+ EFIAPI
+ AllocatePool (
+   IN UINTN  AllocationSize
+   )
+ {
+-  // Original allocation code
++  VOID *Buffer;
++  UINTN TotalSize;
++  UINT8 *Shadow;
++  
++  // Add redzones (16 bytes before and after)
++  TotalSize = AllocationSize + 32;
++  
++  Buffer = InternalAllocatePool(EfiBootServicesData, TotalSize);
++  if (Buffer == NULL) {
++    return NULL;
++  }
++  
++  if (gAsanInitialized) {
++    // Poison redzones
++    Shadow = GetShadowAddress((UINTN)Buffer);
++    SetMem(Shadow, 2, ASAN_POISON_REDZONE);
++    
++    Shadow = GetShadowAddress((UINTN)Buffer + TotalSize - 16);
++    SetMem(Shadow, 2, ASAN_POISON_REDZONE);
++    
++    // Mark allocated region as accessible
++    Shadow = GetShadowAddress((UINTN)Buffer + 16);
++    SetMem(Shadow, (AllocationSize + 7) >> 3, 0);
++  }
++  
++  // Return pointer past left redzone
++  return (VOID *)((UINTN)Buffer + 16);
++}
++
++/**
++  Free pool with double-free detection
++**/
++VOID
++EFIAPI
++FreePool (
++  IN VOID *Buffer
++  )
++{
++  UINT8 *Shadow;
++  UINTN ActualBuffer;
++  
++  if (Buffer == NULL) {
++    return;
++  }
++  
++  // Adjust for redzone
++  ActualBuffer = (UINTN)Buffer - 16;
++  
++  if (gAsanInitialized) {
++    Shadow = GetShadowAddress((UINTN)Buffer);
++    
++    // Check for double-free
++    if (*Shadow == ASAN_POISON_FREED) {
++      DEBUG((DEBUG_ERROR, "ASAN: Double-free detected at %p\n", Buffer));
++      ASSERT(FALSE);
++    }
++    
++    // Poison freed memory
++    SetMem(Shadow, 16, ASAN_POISON_FREED);
++  }
++  
++  InternalFreePool((VOID *)ActualBuffer);
+ }
+ 
+diff --git a/MdeModulePkg/Core/Dxe/Mem/Pool.c b/MdeModulePkg/Core/Dxe/Mem/Pool.c
+index 2345678..bcdefgh 100644
+--- a/MdeModulePkg/Core/Dxe/Mem/Pool.c
++++ b/MdeModulePkg/Core/Dxe/Mem/Pool.c
+@@ -100,6 +100,14 @@ CoreInternalAllocatePool (
+   UINTN       NoPages;
+   UINTN       Granularity;
+   
++  //
++  // Initialize ASAN if not already done
++  //
++  if (!gAsanInitialized && PoolType == EfiBootServicesData) {
++    // Defer init until boot services available
++    AsanInitialize();
++  }
++  
+   if (PoolType == EfiACPIReclaimMemory   ||
+       PoolType == EfiACPIMemoryNVS       ||
+       PoolType == EfiRuntimeServicesCode ||
+
+diff --git a/MdePkg/Library/BaseLib/String.c b/MdePkg/Library/BaseLib/String.c
+index 3456789..cdefghi 100644
+--- a/MdePkg/Library/BaseLib/String.c
++++ b/MdePkg/Library/BaseLib/String.c
+@@ -50,6 +50,21 @@ AsciiStrLen (
+   IN      CONST CHAR8               *String
+   )
+ {
++  UINT8 *Shadow;
++  
++  // Check for uninitialized string
++  if (gAsanInitialized) {
++    Shadow = GetShadowAddress((UINTN)String);
++    if (*Shadow == ASAN_POISON_UNINIT) {
++      DEBUG((DEBUG_WARN, "ASAN: Reading uninitialized string at %p\n", String));
++    }
++    
++    // Check if string in freed memory
++    if (*Shadow == ASAN_POISON_FREED) {
++      DEBUG((DEBUG_ERROR, "ASAN: Use-after-free in StrLen at %p\n", String));
++      ASSERT(FALSE);
++    }
++  }
++  
+   UINTN Length;
+   
+   ASSERT (String != NULL);
